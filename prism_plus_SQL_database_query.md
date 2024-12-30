@@ -1,4 +1,9 @@
--- counts number of duplicate rows in users table by user_crm_id and ordering from most recent latest_login_date
+> [!IMPORTANT] Script was written to function in Google BigQuery for a non-public database from iO Sphere. DO NOT RUN IN GITHUB! 
+
+> [!WARNING] Script was ultimately faulty when summarising transaction information, particularly items sold and sales made. 
+Relevant data for rest of project was borrowed from a fellow student, which shared the identical goals and process of the project.
+
+-- counts number of duplicate rows in users table by user_crm_id and ordering from most recent latest_login_date 
 WITH row_check AS (
   SELECT *,
   ROW_NUMBER() OVER (PARTITION BY user_crm_id ORDER BY latest_login_date DESC) row_num
