@@ -1,0 +1,191 @@
+-- counts number of duplicate rows in users table by user_crm_id and ordering from most recent latest_login_date
+WITH row_check AS (
+  SELECT *,
+  ROW_NUMBER() OVER (PARTITION BY user_crm_id ORDER BY latest_login_date DESC) row_num
+  FROM `warehouse.users`
+),
+
+-- returns only unique user_crm_id with most recent latest_login_date
+cleaned_data AS (
+  SELECT * except(row_num) FROM row_check
+  WHERE row_num=1 AND user_crm_id IS NOT NULL
+),
+
+-- counts number of duplicte rows in transactions table by session_id and ordering from most recent latest_login_date
+-- reason for cleaning: sessions can carry over to next day due to users staying logged in 
+row_check_2 AS (
+  SELECT *,
+  ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY date DESC) row_num
+  FROM `prism-insights.warehouse.transactions`
+),
+
+-- returns only unique sessions with most recent latest_login_date
+cleaned_data_2 AS (
+  SELECT * except(row_num) FROM row_check_2
+  WHERE row_num=1 AND session_id IS NOT NULL
+),
+
+-- calculates total revenue of transactions of each transaction, followed by its associated cost
+purchase_cost AS (
+SELECT
+  date,
+  transaction_id,
+--  SUM(item_quantity*item_price) AS item_revenue,
+  SUM(item_quantity*cost_of_item) AS transaction_cost
+FROM prism-insights.warehouse.transactionsanditems AS tt
+LEFT JOIN prism-insights.warehouse.product_costs AS p
+ON tt.item_id = p.item_id
+GROUP BY date,transaction_id
+),
+
+-- calculates the generic sum of items purchased in a transaction, as well as the coupons used and revenue (minus shipping)
+purchase AS (
+SELECT 
+  user_crm_id,
+  t.date AS transaction_date,
+  t.transaction_id,
+  transaction_coupon,
+  SUM(item_quantity) AS total_quantity,
+  -- SUM(item_revenue-item_cost) AS total_revenue,
+  transaction_cost,
+  transaction_total-transaction_shipping AS transaction_total, -- excludes shipping cost
+FROM cleaned_data_2 AS t
+LEFT JOIN purchase_cost AS p
+ON t.transaction_id = p.transaction_id AND t.date = p.date
+LEFT JOIN prism-insights.warehouse.transactionsanditems AS tt
+ON t.transaction_id = tt.transaction_id
+GROUP BY 1,2,3,4,6,7
+),
+
+-- calculates quantity of items returned with the associated transaction_id as well as the resulting cost
+-- notice that criteria is exclusively for returned products - exchanged products have undefinted/negilgible cost 
+--compared to the definitive cost of refunding customers
+return AS (
+SELECT
+  transaction_id,
+  SUM(return_quantity) AS return_quantity,
+  SUM(return_quantity*item_list_price) AS return_cost
+FROM prism-insights.blue_team_lc6.full_returns AS r
+LEFT JOIN prism-insights.warehouse.product_listprices AS p
+ON r.item_id = p.item_id
+WHERE return_status = 'Refund'
+GROUP BY 1
+),
+
+-- returns transactions of each user made at 2021
+-- used to define control group customers
+pre_2022 AS (
+  SELECT
+    user_crm_id,
+    transaction_id
+  FROM purchase
+  WHERE transaction_date BETWEEN '2021-01-01' AND '2021-12-31'
+),
+
+-- returns transactions for each user and their associate aggregations and dimensions
+pro_2022 AS (
+  SELECT
+    user_crm_id,
+    transaction_id,
+    transaction_date,
+    total_quantity,
+    transaction_cost,
+    transaction_total,
+    transaction_coupon,
+  FROM purchase
+  WHERE transaction_date BETWEEN '2022-01-01' AND '2022-12-31'
+),
+
+-- returns total aggregation of the following for each user, restricted only to 2022 transaction data
+agg_trans AS (
+SELECT
+  p.user_crm_id,
+  COUNT(DISTINCT p.transaction_id) AS transactions_total, -- count of all transactions by the customer, including at 2020
+  COUNT(DISTINCT p3.transaction_id) AS transactions_at_2022,
+  COUNT(DISTINCT p2.transaction_id) AS transactions_before_2022,
+  MAX(p.transaction_date) AS latest_transaction_date,
+  SUM(p3.total_quantity) AS purchase_quantity,
+  COUNT(p3.transaction_coupon) AS coupon_count,
+  ROUND(SUM(p3.transaction_total),2) AS overall_revenue,
+  ROUND(SUM(p3.transaction_cost),2) AS overall_cost,
+  COALESCE(SUM(return_quantity),0) AS return_quantity,
+  COALESCE(SUM(return_cost),0) AS total_return_cost
+FROM purchase AS p -- count only transactions made at 2022
+LEFT JOIN pre_2022 AS p2
+ON p.user_crm_id = p2.user_crm_id
+LEFT JOIN pro_2022 AS p3
+ON p.user_crm_id = p3.user_crm_id
+LEFT JOIN return AS r
+ON p3.transaction_id = r.transaction_id
+GROUP BY user_crm_id
+),
+
+user_data AS (
+SELECT
+  DISTINCT u.user_crm_id,
+  --registration_date,
+  --latest_login_date,
+  DATE_DIFF('2022-12-31',first_purchase_date,day) AS days_first_transaction,
+  DATE_DIFF('2022-12-31',latest_login_date,day) AS days_last_active,
+  COALESCE(DATE_DIFF('2022-12-31',latest_transaction_date,day),0) AS days_last_transaction,
+  -- DATE_DIFF('2022-12-31',registration_date,day) AS days_since_registration, -- 6 months = 183 days
+  COALESCE(t.transactions_at_2022,NULL) AS transaction_count_2022,
+    -- counting only transactions made at 2022 to see how control group has performed at the same time as Prism-Plus
+  COALESCE(transactions_before_2022,0) AS pre2022_transaction_count,
+    -- counting pre-2022 transactions to define non-Prism-Plus customers by identical segments
+  COALESCE(t.transactions_total,0) AS transaction_count_total,
+    -- counting all transactions made as a personal sanity check 
+  COALESCE(purchase_quantity,NULL) AS purchase_quantity,
+  COALESCE(coupon_count,0) AS coupon_count,
+  COALESCE(ROUND(overall_revenue,2),NULL) AS overall_revenue,
+  COALESCE(ROUND(overall_cost,2),NULL) AS overall_cost,
+    -- Selected only direct values from transactions table for consistency
+  COALESCE(return_quantity,NULL) AS return_quantity,
+  COALESCE(ROUND(total_return_cost,2),0) AS total_return_cost,
+  COALESCE(ROUND(overall_revenue - overall_cost - total_return_cost,2),0) AS customer_profit,
+  opt_in_status,
+  prism_plus_status,
+  COALESCE(prism_plus_tier,'N/A') AS prism_plus_tier
+FROM cleaned_data AS u
+LEFT JOIN agg_trans AS t
+ON u.user_crm_id = t.user_crm_id
+--WHERE u.user_crm_id IN ('6287651', '4496798', '4727381') -- test users, latter is a (churned) Platinum
+--WHERE prism_plus_status = true
+),
+
+customer_segment AS (
+SELECT
+  * EXCEPT(pre2022_transaction_count),
+   --EXCEPT(days_last_active, days_last_transaction, days_since_registration),
+    -- removed days count columns to save space - only needed for customer segmentation
+  COALESCE(ROUND((overall_revenue/transaction_count_2022),2),0) AS customer_ABV_2022,
+  COALESCE(ROUND((return_quantity/purchase_quantity)*100),0) AS customer_return_rate_2022,
+  CASE 
+  WHEN days_last_active > 440 THEN 'Churned customer' -- Account for customers who may not be active since Prism-Plus
+  WHEN days_last_active > 365 THEN 'Dormant customer'
+  WHEN transaction_count_2022 = 1 AND overall_revenue > 25 THEN 'Single-bulk customer'
+  WHEN transaction_count_2022 = 1 THEN 'Single-purchase customer'
+  WHEN transaction_count_2022 = 0 AND days_last_active < 180 THEN 'Non-purchase customer'
+  WHEN days_last_transaction BETWEEN 1 AND 180 OR days_last_active <= 180 THEN 'Active customer'
+  WHEN days_last_active < 180 THEN 'New customer'
+  WHEN pre2022_transaction_count = 0 AND days_last_transaction BETWEEN 1 AND 365 AND days_first_transaction > 730 THEN 'Reactivated customer'
+  ELSE 'Other' END AS customer_group,
+  CASE 
+  WHEN prism_plus_tier = 'Bronze' THEN 'True Bronze'
+  WHEN prism_plus_tier = 'Silver' THEN 'True Silver'
+  WHEN prism_plus_tier = 'Gold' THEN 'True Gold'
+  WHEN prism_plus_tier = 'Platinum' THEN 'True Platinum'
+  WHEN pre2022_transaction_count = 1 AND prism_plus_status IS false THEN 'Control Bronze'
+  WHEN pre2022_transaction_count = 2 AND prism_plus_status IS false THEN 'Control Silver'
+  WHEN pre2022_transaction_count = 3 AND prism_plus_status IS false THEN 'Control Gold'
+  WHEN pre2022_transaction_count >= 4 AND prism_plus_status IS false THEN 'Control Platinum'
+  ELSE 'Irrelevant' END AS prism_tier
+    -- Irrelevant customers (<2021 non-purchasers/churned) will be excluded from the statistical test
+FROM user_data
+)
+
+SELECT *
+FROM customer_segment
+WHERE prism_tier != 'Irrelevant' OR (prism_tier = 'Irrelevant' AND customer_group = 'Reactivated customer')
+--WHERE prism_tier = 'Irrelevant' AND customer_group = 'Reactivated customer'
+--LIMIT 50;
